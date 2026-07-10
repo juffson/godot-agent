@@ -1,0 +1,14 @@
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.2
+reloadable = true
+
+[libraries]
+
+macos.debug = "res://addons/godot_agent/lib/libgodot_agent.dylib"
+macos.release = "res://addons/godot_agent/lib/libgodot_agent.dylib"
+linux.debug.x86_64 = "res://addons/godot_agent/lib/libgodot_agent.so"
+linux.release.x86_64 = "res://addons/godot_agent/lib/libgodot_agent.so"
+windows.debug.x86_64 = "res://addons/godot_agent/lib/godot_agent.dll"
+windows.release.x86_64 = "res://addons/godot_agent/lib/godot_agent.dll"
