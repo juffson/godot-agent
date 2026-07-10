@@ -8,18 +8,23 @@
 //! Threading model: the HTTP thread (server.rs) never touches Godot APIs.
 //! It queues jobs; `process()` drains them each frame on the main thread.
 
+mod chat;
 mod ops;
 mod server;
 
 use std::sync::mpsc::{Receiver, channel};
 
+use godot::classes::control::SizeFlags;
+use godot::classes::editor_plugin::DockSlot;
 use godot::classes::{
-    EditorInterface, EditorPlugin, Engine, GDScript, IEditorPlugin, Node, ProjectSettings, Script,
+    Button, EditorInterface, EditorPlugin, Engine, GDScript, HBoxContainer, IEditorPlugin,
+    LineEdit, Node, ProjectSettings, RichTextLabel, Script, VBoxContainer,
 };
 use godot::global::Error as GdError;
 use godot::prelude::*;
 use serde_json::{Value, json};
 
+use chat::{ChatEvent, ChatSession};
 use ops::{EditorOp, Job};
 use server::McpHttpServer;
 
@@ -34,6 +39,12 @@ pub struct GodotMcpEditor {
     base: Base<EditorPlugin>,
     jobs: Option<Receiver<Job>>,
     http: Option<McpHttpServer>,
+    mcp_port: u16,
+    // Chat dock
+    dock: Option<Gd<VBoxContainer>>,
+    transcript: Option<Gd<RichTextLabel>>,
+    input: Option<Gd<LineEdit>>,
+    chat: Option<ChatSession>,
 }
 
 #[godot_api]
@@ -49,13 +60,25 @@ impl IEditorPlugin for GodotMcpEditor {
             Ok(http) => {
                 self.jobs = Some(rx);
                 self.http = Some(http);
+                self.mcp_port = port;
                 godot_print!("[MCP] Editor MCP server listening on http://127.0.0.1:{port}/mcp");
             }
             Err(e) => godot_error!("[MCP] Failed to start MCP server: {e}"),
         }
+
+        self.build_chat_dock();
     }
 
     fn exit_tree(&mut self) {
+        if let Some(mut chat) = self.chat.take() {
+            chat.kill();
+        }
+        if let Some(mut dock) = self.dock.take() {
+            self.base_mut().remove_control_from_docks(&dock);
+            dock.queue_free();
+        }
+        self.transcript = None;
+        self.input = None;
         if let Some(http) = self.http.take() {
             http.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
             http.server.unblock();
@@ -64,13 +87,161 @@ impl IEditorPlugin for GodotMcpEditor {
     }
 
     fn process(&mut self, _delta: f64) {
-        let Some(rx) = &self.jobs else { return };
-        // Drain pending jobs on the main thread; editor APIs are not thread-safe.
-        while let Ok(job) = rx.try_recv() {
-            let result = execute_op(&job.op);
-            let _ = job.reply.send(result);
+        // Drain pending MCP jobs on the main thread; editor APIs are not thread-safe.
+        if let Some(rx) = &self.jobs {
+            while let Ok(job) = rx.try_recv() {
+                let result = execute_op(&job.op);
+                let _ = job.reply.send(result);
+            }
+        }
+
+        // Drain chat events from the Claude CLI reader thread.
+        let mut lines: Vec<String> = Vec::new();
+        let mut process_died = false;
+        if let Some(chat) = &self.chat {
+            while let Ok(event) = chat.events.try_recv() {
+                match event {
+                    ChatEvent::AssistantText(text) => {
+                        lines.push(format!("{}\n", esc_bbcode(&text)));
+                    }
+                    ChatEvent::ToolUse(name) => {
+                        lines.push(format!("[color=#7f8c8d]⚙ {}[/color]\n", esc_bbcode(&name)));
+                    }
+                    ChatEvent::TurnDone { error } => {
+                        if let Some(err) = error {
+                            lines.push(format!("[color=#e06c75]✗ {}[/color]\n", esc_bbcode(&err)));
+                        }
+                    }
+                    ChatEvent::ProcessExit(msg) => {
+                        lines.push(format!("[color=#e06c75]{}[/color]\n", esc_bbcode(&msg)));
+                        process_died = true;
+                    }
+                }
+            }
+        }
+        if process_died {
+            self.chat = None;
+        }
+        for line in lines {
+            self.append_transcript(&line);
         }
     }
+}
+
+#[godot_api]
+impl GodotMcpEditor {
+    /// Build the "AI Chat" dock panel and attach it to the editor.
+    fn build_chat_dock(&mut self) {
+        let mut dock = VBoxContainer::new_alloc();
+        dock.set_name("AI Chat");
+
+        let mut transcript = RichTextLabel::new_alloc();
+        transcript.set_use_bbcode(true);
+        transcript.set_scroll_follow(true);
+        transcript.set_selection_enabled(true);
+        transcript.set_v_size_flags(SizeFlags::EXPAND_FILL);
+        transcript.append_text(
+            "[color=#7f8c8d]Chat with Claude about this project. It can see and edit the live editor (scene tree, nodes, scripts).[/color]\n",
+        );
+        dock.add_child(&transcript);
+
+        let mut row = HBoxContainer::new_alloc();
+
+        let mut input = LineEdit::new_alloc();
+        input.set_h_size_flags(SizeFlags::EXPAND_FILL);
+        input.set_placeholder("Ask or instruct… (Enter to send)");
+        input.connect("text_submitted", &self.to_gd().callable("on_input_submitted"));
+        row.add_child(&input);
+
+        let mut send = Button::new_alloc();
+        send.set_text("Send");
+        send.connect("pressed", &self.to_gd().callable("on_send_pressed"));
+        row.add_child(&send);
+
+        let mut fresh = Button::new_alloc();
+        fresh.set_text("New");
+        fresh.set_tooltip_text("End the current conversation and start a new one");
+        fresh.connect("pressed", &self.to_gd().callable("on_new_pressed"));
+        row.add_child(&fresh);
+
+        dock.add_child(&row);
+
+        self.base_mut().add_control_to_dock(DockSlot::RIGHT_UL, &dock);
+        self.dock = Some(dock);
+        self.transcript = Some(transcript);
+        self.input = Some(input);
+    }
+
+    #[func]
+    fn on_input_submitted(&mut self, _text: GString) {
+        self.submit_message();
+    }
+
+    #[func]
+    fn on_send_pressed(&mut self) {
+        self.submit_message();
+    }
+
+    #[func]
+    fn on_new_pressed(&mut self) {
+        if let Some(mut chat) = self.chat.take() {
+            chat.kill();
+        }
+        if let Some(transcript) = &mut self.transcript {
+            transcript.clear();
+        }
+        self.append_transcript("[color=#7f8c8d]New conversation started.[/color]\n");
+    }
+
+    fn submit_message(&mut self) {
+        let Some(input) = &mut self.input else { return };
+        let text = input.get_text().to_string();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        input.clear();
+
+        // Lazily start the Claude process on first message.
+        if self.chat.is_none() {
+            let project_root = ProjectSettings::singleton()
+                .globalize_path("res://")
+                .to_string();
+            match ChatSession::spawn(&project_root, self.mcp_port) {
+                Ok(session) => self.chat = Some(session),
+                Err(e) => {
+                    self.append_transcript(&format!(
+                        "[color=#e06c75]{}[/color]\n",
+                        esc_bbcode(&e)
+                    ));
+                    return;
+                }
+            }
+        }
+
+        self.append_transcript(&format!(
+            "\n[color=#6da9ff][b]You[/b][/color]  {}\n",
+            esc_bbcode(&text)
+        ));
+
+        if let Some(chat) = &mut self.chat {
+            if let Err(e) = chat.send(&text) {
+                self.append_transcript(&format!("[color=#e06c75]{}[/color]\n", esc_bbcode(&e)));
+                self.chat = None;
+            }
+        }
+    }
+
+    fn append_transcript(&mut self, bbcode: &str) {
+        if let Some(transcript) = &mut self.transcript {
+            transcript.append_text(bbcode);
+        }
+    }
+}
+
+/// Escape user/model text so it renders literally inside the bbcode transcript.
+fn esc_bbcode(text: &str) -> String {
+    text.replace('[', "[lb]")
 }
 
 fn execute_op(op: &EditorOp) -> Result<Value, String> {
