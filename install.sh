@@ -32,7 +32,14 @@ case "$(uname -s)" in
   Linux)  LIB="libgodot_agent.so" ;;
   *)      LIB="godot_agent.dll" ;;
 esac
+# Remove before copying: overwriting a dylib in place keeps the same inode,
+# which invalidates macOS's kernel signature cache and gets Godot SIGKILLed
+# with "Code Signature Invalid" on the next dlopen.
+rm -f "$DEST/lib/$LIB"
 cp "target/$PROFILE/$LIB" "$DEST/lib/"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  codesign --force -s - "$DEST/lib/$LIB"
+fi
 
 echo "Installed godot_agent ($PROFILE) to $DEST"
 echo "Open the project in the Godot editor; the MCP server starts automatically."
