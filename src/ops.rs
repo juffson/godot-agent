@@ -1,8 +1,6 @@
 //! Editor operations: requested by the HTTP thread, executed on the Godot
 //! main thread (editor APIs are not thread-safe).
 
-use std::sync::mpsc::Sender;
-
 use serde_json::{Value, json};
 
 /// One operation the HTTP thread asks the main thread to perform.
@@ -15,12 +13,6 @@ pub enum EditorOp {
     PlayScene { scene_path: Option<String> },
     StopPlaying,
     ExecuteScript { code: String },
-}
-
-/// A queued job: the op plus a channel to send the outcome back.
-pub struct Job {
-    pub op: EditorOp,
-    pub reply: Sender<Result<Value, String>>,
 }
 
 /// MCP tool definitions served by `tools/list`.

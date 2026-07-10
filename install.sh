@@ -25,6 +25,7 @@ fi
 DEST="$PROJECT/addons/godot_agent"
 mkdir -p "$DEST/lib"
 cp addon/godot_agent/godot_agent.gdextension "$DEST/"
+cp addon/godot_agent/runtime.gd "$DEST/"
 
 case "$(uname -s)" in
   Darwin) LIB="libgodot_agent.dylib" ;;

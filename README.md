@@ -14,10 +14,19 @@ Install a single GDExtension into your project and you get two things:
    session whose MCP config points back at this same editor, so the assistant
    you chat with can directly see and modify what you're working on.
 
+And when you run the game, a third piece comes alive:
+
+3. **An MCP server inside the running game** (port 6011) — input simulation
+   (clicks, keys, actions from the project's input map), screenshots of the
+   rendered frame, the live runtime scene tree, and script execution in the
+   game context. The AI can play the game: press buttons, read state, look at
+   the screen.
+
 ```
 AI Chat dock ─→ claude CLI ─┐
-                            ├─→ HTTP (MCP streamable JSON) ─→ Godot editor process
-external MCP clients ───────┘
+                            ├─→ :6010/mcp ─→ Godot editor process
+external MCP clients ───────┤
+                            └─→ :6011/mcp ─→ running game process
 ```
 
 ## Requirements
@@ -64,7 +73,30 @@ Set `GODOT_MCP_HTTP_PORT` before launching the editor to change the port.
 
 `execute_editor_script` is the universal escape hatch — anything the editor
 API can do (create nodes, edit resources, inspect selection, trigger imports)
-can be done through it. Example prompt for your assistant:
+can be done through it.
+
+### Game-side tools (port 6011, while the game runs)
+
+The editor plugin auto-registers a `GodotAgentRuntime` autoload in your
+project settings. When the game starts, it serves MCP on
+`http://127.0.0.1:6011/mcp` (override with `GODOT_AGENT_GAME_PORT`):
+
+| Tool | Description |
+|---|---|
+| `get_game_info` | FPS, current scene, window size, pause state |
+| `get_scene_tree` | Live runtime node tree (autoloads + dynamic nodes) |
+| `capture_screenshot` | Rendered frame as an image (max 1280px wide) |
+| `simulate_input` | Timed input sequences: `key`, `text`, `mouse_click`, `mouse_move`, `action` (input-map actions), `wait` — spaced across frames like real input |
+| `execute_script` | Arbitrary GDScript in the game process (`Engine.get_main_loop()` reaches the SceneTree) |
+
+Connect an external client with:
+
+```bash
+claude mcp add --transport http godot-game http://127.0.0.1:6011/mcp
+```
+
+(The chat dock includes both servers automatically; start the game before
+pressing New if you want the session to see the game-side tools.) Example prompt for your assistant:
 
 > "Add a CharacterBody2D named Player with a Sprite2D child to the current
 > scene, then save."

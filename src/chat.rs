@@ -33,8 +33,14 @@ impl ChatSession {
     /// with MCP access to this editor instance only.
     pub fn spawn(project_root: &str, mcp_port: u16) -> Result<Self, String> {
         let claude = find_claude()?;
+        // Include the game-side server too; if the game isn't running Claude
+        // simply reports that server as unavailable.
+        let game_port = std::env::var("GODOT_AGENT_GAME_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(crate::server::DEFAULT_GAME_PORT);
         let mcp_config = format!(
-            r#"{{"mcpServers":{{"godot-editor":{{"type":"http","url":"http://127.0.0.1:{mcp_port}/mcp"}}}}}}"#
+            r#"{{"mcpServers":{{"godot-editor":{{"type":"http","url":"http://127.0.0.1:{mcp_port}/mcp"}},"godot-game":{{"type":"http","url":"http://127.0.0.1:{game_port}/mcp"}}}}}}"#
         );
 
         let mut child = Command::new(&claude)
@@ -44,7 +50,7 @@ impl ChatSession {
                 "--output-format", "stream-json",
                 "--verbose",
                 "--permission-mode", "acceptEdits",
-                "--allowedTools", "mcp__godot-editor",
+                "--allowedTools", "mcp__godot-editor,mcp__godot-game",
                 "--mcp-config", &mcp_config,
                 "--strict-mcp-config",
             ])

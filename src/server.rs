@@ -2,7 +2,10 @@
 //!
 //! Speaks JSON-RPC 2.0 over POST. Every `tools/call` is forwarded to the Godot
 //! main thread through the job queue and the HTTP worker blocks until the
-//! editor replies (or times out). Bound to 127.0.0.1 only.
+//! main thread replies (or times out). Bound to 127.0.0.1 only.
+//!
+//! This module is process-agnostic: the editor plugin and the in-game runtime
+//! both start one, with their own tool table and executor.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,18 +15,30 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Response, Server};
 
-use crate::ops::{Job, parse_tool_call, tool_definitions};
+pub const DEFAULT_EDITOR_PORT: u16 = 6010;
+pub const DEFAULT_GAME_PORT: u16 = 6011;
+const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const DEFAULT_PORT: u16 = 6010;
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+/// One tool invocation queued for the Godot main thread.
+pub struct Job {
+    pub name: String,
+    pub args: Value,
+    pub reply: Sender<Result<Value, String>>,
+}
 
 pub struct McpHttpServer {
     pub server: Arc<Server>,
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Start the HTTP server thread. Returns handles for shutdown.
-pub fn start(port: u16, jobs: Sender<Job>) -> Result<McpHttpServer, String> {
+/// Start the HTTP server thread. `tools` is the JSON array served by
+/// `tools/list`; `server_name` goes into the MCP handshake.
+pub fn start(
+    port: u16,
+    server_name: &'static str,
+    tools: Value,
+    jobs: Sender<Job>,
+) -> Result<McpHttpServer, String> {
     let server = Server::http(("127.0.0.1", port))
         .map_err(|e| format!("Failed to bind 127.0.0.1:{port}: {e}"))?;
     let server = Arc::new(server);
@@ -32,11 +47,11 @@ pub fn start(port: u16, jobs: Sender<Job>) -> Result<McpHttpServer, String> {
     let srv = Arc::clone(&server);
     let stop = Arc::clone(&shutdown);
     std::thread::Builder::new()
-        .name("godot-mcp-http".into())
+        .name(format!("{server_name}-http"))
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match srv.recv() {
-                    Ok(request) => handle_request(request, &jobs),
+                    Ok(request) => handle_request(request, server_name, &tools, &jobs),
                     Err(_) => break, // unblock() or fatal error
                 }
             }
@@ -53,7 +68,12 @@ fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>
         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
 }
 
-fn handle_request(mut request: tiny_http::Request, jobs: &Sender<Job>) {
+fn handle_request(
+    mut request: tiny_http::Request,
+    server_name: &str,
+    tools: &Value,
+    jobs: &Sender<Job>,
+) {
     match *request.method() {
         Method::Post => {}
         Method::Delete => {
@@ -106,24 +126,22 @@ fn handle_request(mut request: tiny_http::Request, jobs: &Sender<Job>) {
                 "result": {
                     "protocolVersion": protocol,
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "godot-agent", "version": env!("CARGO_PKG_VERSION") }
+                    "serverInfo": { "name": server_name, "version": env!("CARGO_PKG_VERSION") }
                 }
             })
         }
         "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
         "tools/list" => json!({
             "jsonrpc": "2.0", "id": id,
-            "result": { "tools": tool_definitions() }
+            "result": { "tools": tools }
         }),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            match call_tool(name, &args, jobs) {
+            match call_tool(name, args, jobs) {
                 Ok(result) => json!({
                     "jsonrpc": "2.0", "id": id,
-                    "result": {
-                        "content": [ { "type": "text", "text": stringify_result(&result) } ]
-                    }
+                    "result": { "content": to_content(result) }
                 }),
                 Err(message) => json!({
                     "jsonrpc": "2.0", "id": id,
@@ -143,16 +161,27 @@ fn handle_request(mut request: tiny_http::Request, jobs: &Sender<Job>) {
     let _ = request.respond(json_response(200, &response));
 }
 
-fn call_tool(name: &str, args: &Value, jobs: &Sender<Job>) -> Result<Value, String> {
-    let op = parse_tool_call(name, args)?;
+fn call_tool(name: &str, args: Value, jobs: &Sender<Job>) -> Result<Value, String> {
     let (reply_tx, reply_rx) = channel();
-    jobs.send(Job { op, reply: reply_tx })
-        .map_err(|_| "Editor plugin is shutting down".to_string())?;
+    jobs.send(Job { name: name.to_string(), args, reply: reply_tx })
+        .map_err(|_| "Godot main thread is shutting down".to_string())?;
     reply_rx
         .recv_timeout(TOOL_TIMEOUT)
         .map_err(|_| {
-            "Timed out waiting for the editor main thread. The editor may be busy (e.g. a modal dialog is open) or the scene is playing with the editor paused.".to_string()
+            "Timed out waiting for the Godot main thread. It may be busy, paused, or showing a modal dialog.".to_string()
         })?
+}
+
+/// Executors can return `{"_image_base64": "...", "_mime": "image/png"}` to
+/// send an MCP image content block instead of text.
+fn to_content(result: Value) -> Value {
+    if let Some(obj) = result.as_object() {
+        if let Some(b64) = obj.get("_image_base64").and_then(Value::as_str) {
+            let mime = obj.get("_mime").and_then(Value::as_str).unwrap_or("image/png");
+            return json!([ { "type": "image", "data": b64, "mimeType": mime } ]);
+        }
+    }
+    json!([ { "type": "text", "text": stringify_result(&result) } ])
 }
 
 fn stringify_result(value: &Value) -> String {

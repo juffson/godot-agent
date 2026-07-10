@@ -9,7 +9,9 @@
 //! It queues jobs; `process()` drains them each frame on the main thread.
 
 mod chat;
+mod gd_util;
 mod ops;
+mod runtime;
 mod server;
 
 use std::sync::mpsc::{Receiver, channel};
@@ -17,16 +19,16 @@ use std::sync::mpsc::{Receiver, channel};
 use godot::classes::control::SizeFlags;
 use godot::classes::editor_plugin::DockSlot;
 use godot::classes::{
-    Button, EditorInterface, EditorPlugin, Engine, GDScript, HBoxContainer, IEditorPlugin,
-    LineEdit, Node, ProjectSettings, RichTextLabel, Script, VBoxContainer,
+    Button, EditorInterface, EditorPlugin, Engine, HBoxContainer, IEditorPlugin, LineEdit,
+    ProjectSettings, RichTextLabel, VBoxContainer,
 };
-use godot::global::Error as GdError;
 use godot::prelude::*;
 use serde_json::{Value, json};
 
 use chat::{ChatEvent, ChatSession};
-use ops::{EditorOp, Job};
-use server::McpHttpServer;
+use gd_util::{run_gdscript, serialize_node};
+use ops::EditorOp;
+use server::{Job, McpHttpServer};
 
 struct GodotMcpEditorExtension;
 
@@ -53,10 +55,10 @@ impl IEditorPlugin for GodotMcpEditor {
         let port = std::env::var("GODOT_MCP_HTTP_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(server::DEFAULT_PORT);
+            .unwrap_or(server::DEFAULT_EDITOR_PORT);
 
         let (tx, rx) = channel();
-        match server::start(port, tx) {
+        match server::start(port, "godot-agent", ops::tool_definitions(), tx) {
             Ok(http) => {
                 self.jobs = Some(rx);
                 self.http = Some(http);
@@ -67,6 +69,7 @@ impl IEditorPlugin for GodotMcpEditor {
         }
 
         self.build_chat_dock();
+        self.ensure_runtime_autoload();
     }
 
     fn exit_tree(&mut self) {
@@ -90,7 +93,8 @@ impl IEditorPlugin for GodotMcpEditor {
         // Drain pending MCP jobs on the main thread; editor APIs are not thread-safe.
         if let Some(rx) = &self.jobs {
             while let Ok(job) = rx.try_recv() {
-                let result = execute_op(&job.op);
+                let result =
+                    ops::parse_tool_call(&job.name, &job.args).and_then(|op| execute_op(&op));
                 let _ = job.reply.send(result);
             }
         }
@@ -237,6 +241,19 @@ impl GodotMcpEditor {
             transcript.append_text(bbcode);
         }
     }
+
+    /// Register the in-game runtime (input simulation, screenshots, runtime
+    /// scene tree) as an autoload so it starts with the game. Runs once; the
+    /// setting persists in project.godot.
+    fn ensure_runtime_autoload(&mut self) {
+        let ps = ProjectSettings::singleton();
+        if ps.has_setting("autoload/GodotAgentRuntime") {
+            return;
+        }
+        self.base_mut()
+            .add_autoload_singleton("GodotAgentRuntime", "res://addons/godot_agent/runtime.gd");
+        godot_print!("[MCP] Registered GodotAgentRuntime autoload (game-side MCP on port 6011)");
+    }
 }
 
 /// Escape user/model text so it renders literally inside the bbcode transcript.
@@ -299,31 +316,6 @@ fn get_scene_tree(max_depth: i64) -> Result<Value, String> {
     Ok(serialize_node(&root, max_depth))
 }
 
-fn serialize_node(node: &Gd<Node>, depth: i64) -> Value {
-    let mut info = json!({
-        "name": node.get_name().to_string(),
-        "type": node.get_class().to_string(),
-    });
-
-    if let Some(script) = node.get_script() {
-        let path = script.get_path().to_string();
-        if !path.is_empty() {
-            info["script"] = json!(path);
-        }
-    }
-
-    if depth > 0 && node.get_child_count() > 0 {
-        let children: Vec<Value> = node
-            .get_children()
-            .iter_shared()
-            .map(|child| serialize_node(&child, depth - 1))
-            .collect();
-        info["children"] = json!(children);
-    }
-
-    info
-}
-
 fn open_scene(path: &str) -> Result<Value, String> {
     if !path.starts_with("res://") || !path.ends_with(".tscn") {
         return Err(format!("Expected a res:// path to a .tscn file, got: {path}"));
@@ -350,63 +342,5 @@ fn play_scene(scene_path: Option<&str>) -> Result<Value, String> {
 /// `func run():` in a @tool RefCounted script, so `EditorInterface` and the
 /// full editor API are available. The return value is serialized to JSON.
 fn execute_script(code: &str) -> Result<Value, String> {
-    let mut body = String::new();
-    for line in code.lines() {
-        body.push('\t');
-        body.push_str(line);
-        body.push('\n');
-    }
-    let source = format!("@tool\nextends RefCounted\nfunc run():\n{body}");
-
-    let mut script = GDScript::new_gd();
-    script.set_source_code(&source);
-    let err = script.reload();
-    if err != GdError::OK {
-        return Err(format!(
-            "GDScript parse error ({err:?}). The code runs inside `func run():` — check indentation and syntax."
-        ));
-    }
-
-    let instance = script.call("new", &[]);
-    let mut instance = instance
-        .try_to::<Gd<RefCounted>>()
-        .map_err(|e| format!("Failed to instantiate script: {e}"))?;
-    let result = instance.call("run", &[]);
-    Ok(variant_to_json(&result, 0))
-}
-
-fn variant_to_json(value: &Variant, depth: u32) -> Value {
-    if depth > 8 {
-        return json!(value.to_string());
-    }
-    match value.get_type() {
-        VariantType::NIL => Value::Null,
-        VariantType::BOOL => json!(value.to::<bool>()),
-        VariantType::INT => json!(value.to::<i64>()),
-        VariantType::FLOAT => json!(value.to::<f64>()),
-        VariantType::STRING | VariantType::STRING_NAME | VariantType::NODE_PATH => {
-            json!(value.to_string())
-        }
-        VariantType::ARRAY => {
-            let arr = value.to::<VarArray>();
-            Value::Array(
-                arr.iter_shared()
-                    .map(|v| variant_to_json(&v, depth + 1))
-                    .collect(),
-            )
-        }
-        VariantType::DICTIONARY => {
-            let dict = value.to::<Dictionary<Variant, Variant>>();
-            let mut map = serde_json::Map::new();
-            for (k, v) in dict.iter_shared() {
-                map.insert(k.to_string(), variant_to_json(&v, depth + 1));
-            }
-            Value::Object(map)
-        }
-        VariantType::PACKED_STRING_ARRAY => {
-            let arr = value.to::<PackedStringArray>();
-            Value::Array(arr.to_vec().iter().map(|s| json!(s.to_string())).collect())
-        }
-        _ => json!(value.to_string()),
-    }
+    run_gdscript(code)
 }
