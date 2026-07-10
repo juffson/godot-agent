@@ -57,7 +57,11 @@ pub fn run_gdscript(code: &str) -> Result<Value, String> {
     let mut instance = instance
         .try_to::<Gd<RefCounted>>()
         .map_err(|e| format!("Failed to instantiate script: {e}"))?;
-    let result = instance.call("run", &[]);
+    // try_call: a runtime error in the script (bad index, null access…) must
+    // come back as an error response, not a panic that eats the reply.
+    let result = instance
+        .try_call("run", &[])
+        .map_err(|e| format!("Script runtime error: {e}"))?;
     Ok(variant_to_json(&result, 0))
 }
 
