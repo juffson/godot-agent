@@ -138,6 +138,44 @@ The `claude` binary is resolved via a login shell (Homebrew paths work even
 when the editor is launched from Finder); override with the
 `GODOT_AGENT_CLAUDE_BIN` environment variable.
 
+## Usage examples
+
+With Claude Code connected (`claude mcp add --transport http godot-editor
+http://127.0.0.1:6010/mcp`), just describe what you want:
+
+> "Open the login scene and show me its node tree"
+> "Run the game, screenshot the title screen, and check if the buttons overlap"
+> "Click the Login button, wait, and verify the scene changed"
+
+Or drive it from any HTTP client — the servers speak plain JSON-RPC:
+
+```bash
+# What is the editor looking at right now?
+curl -s -X POST http://127.0.0.1:6010/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"get_editor_info","arguments":{}}}'
+
+# Find every button in the running game, with clickable coordinates
+curl -s -X POST http://127.0.0.1:6011/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":2,"method":"tools/call",
+  "params":{"name":"execute_script","arguments":{"code":
+    "var out = []\nfor b in Engine.get_main_loop().current_scene.find_children(\"*\", \"Button\", true, false):\n\tvar r = b.get_global_rect()\n\tout.append({\"text\": b.text, \"center\": [r.get_center().x, r.get_center().y], \"disabled\": b.disabled})\nreturn out"}}}'
+
+# Click one of them like a real player would
+curl -s -X POST http://127.0.0.1:6011/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":3,"method":"tools/call",
+  "params":{"name":"simulate_input","arguments":{"events":[
+    {"type":"mouse_click","x":640,"y":461}]}}}'
+```
+
+A typical debugging session: read the UI structure (`execute_script`) →
+reproduce the player's actions (`simulate_input`) → verify logic state
+(`get_game_info` / `execute_script`) → verify rendering (`capture_screenshot`).
+Structured reads are precise and cheap; screenshots catch what data can't
+(overlapping layout, missing textures, theme issues).
+
+See [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md) for a Chinese usage guide.
+
 ## Architecture
 
 - `src/server.rs` — HTTP thread. Minimal MCP streamable-HTTP implementation
