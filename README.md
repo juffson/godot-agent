@@ -31,10 +31,34 @@ external MCP clients ───────┤
 
 ## Requirements
 
-- Rust toolchain (1.85+)
+- Rust toolchain (1.85+) — build time only
 - Godot 4.2+ (tested on 4.6.3)
 - [Claude Code](https://claude.com/claude-code) CLI installed and logged in
-  (only needed for the chat dock; the MCP server works without it)
+  (only needed for the chat dock; the MCP servers work without it)
+
+**No Node.js, npm, or external server process.** The whole thing is one Rust
+dylib; MCP is served natively from inside the Godot processes over plain HTTP.
+
+## How it works — end-to-end flow
+
+1. `./install.sh <project>` builds the extension and copies
+   `addons/godot_agent/` (gdextension manifest + dylib + autoload stub) into
+   your project.
+2. **Open the project in the Godot editor.** The GDExtension loads
+   automatically (no plugin enabling needed) and the `EditorPlugin`:
+   - starts the editor MCP server on `127.0.0.1:6010/mcp`,
+   - adds the **AI Chat** dock,
+   - registers the `GodotAgentRuntime` autoload in project settings (once).
+3. **Run the game** (F5, or let the AI call `play_scene`). The autoload
+   starts the game MCP server on `127.0.0.1:6011/mcp`.
+4. **Connect an AI:**
+   - the built-in AI Chat dock spawns a headless Claude Code session
+     preconfigured with both servers, or
+   - any external MCP client connects to either port over HTTP.
+
+A typical loop the AI can drive end-to-end: edit a scene (6010) → play it
+(6010) → screenshot the rendered frame (6011) → click buttons / type text
+(6011) → read the runtime scene tree to verify (6011) → stop (6010).
 
 ## Install
 
