@@ -17,7 +17,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 pub const DEFAULT_EDITOR_PORT: u16 = 6010;
 pub const DEFAULT_GAME_PORT: u16 = 6011;
-const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+const TOOL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One tool invocation queued for the Godot main thread.
 pub struct Job {
@@ -46,12 +46,22 @@ pub fn start(
 
     let srv = Arc::clone(&server);
     let stop = Arc::clone(&shutdown);
+    let tools = Arc::new(tools);
     std::thread::Builder::new()
         .name(format!("{server_name}-http"))
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match srv.recv() {
-                    Ok(request) => handle_request(request, server_name, &tools, &jobs),
+                    // 每个请求丢到独立线程处理:一个慢/卡住的 job(战斗回合动画、或坏属性脚本
+                    // 卡住主线程)最多占住它自己的线程 + 到 TOOL_TIMEOUT 失败,**不再阻塞 accept
+                    // 循环** → 其它请求仍被接受、快速拿到错误,不会表现成"整个 MCP 冻死拒连"。
+                    Ok(request) => {
+                        let tools = Arc::clone(&tools);
+                        let jobs = jobs.clone();
+                        let _ = std::thread::Builder::new()
+                            .name(format!("{server_name}-req"))
+                            .spawn(move || handle_request(request, server_name, tools.as_ref(), &jobs));
+                    }
                     Err(_) => break, // unblock() or fatal error
                 }
             }
