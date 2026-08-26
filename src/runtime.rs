@@ -172,7 +172,7 @@ fn game_tool_definitions() -> Value {
         },
         {
             "name": "simulate_input",
-            "description": "Inject a timed sequence of input events into the running game, as if a player performed them. Events: {type:'key', key:'Enter'|'A'|'Escape'|..., pressed?:bool} (omit pressed for tap), {type:'text', text:'hello'} (types characters), {type:'mouse_click', x, y, button?:'left'|'right'|'middle', double?:bool}, {type:'mouse_move', x, y}, {type:'action', action:'ui_accept', pressed?:bool} (omit pressed for tap, uses the project's input map), {type:'wait', ms:500}. Events are spaced across frames automatically; returns after the last event is dispatched.",
+            "description": "Inject a timed sequence of input events into the running game, as if a player performed them. Events: {type:'key', key:'Enter'|'A'|'Escape'|..., pressed?:bool} (omit pressed for tap), {type:'text', text:'hello'} (types characters), {type:'mouse_click', x, y, button?:'left'|'right'|'middle', double?:bool}, {type:'mouse_move', x, y}, {type:'mouse_button', x, y, button?, pressed:bool} (explicit non-paired down/up — for drags: mouse_button(down) then mouse_move* then mouse_button(up)), {type:'action', action:'ui_accept', pressed?:bool} (omit pressed for tap, uses the project's input map), {type:'wait', ms:500}. Events are spaced across frames automatically; returns after the last event is dispatched.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -335,6 +335,17 @@ fn build_timeline(args: &Value) -> Result<VecDeque<(f64, Gd<InputEvent>)>, Strin
             "mouse_move" => {
                 let (x, y) = point(entry, i)?;
                 push(&mut timeline, &mut pending_delay, motion_event(x, y), EVENT_GAP);
+            }
+            // 显式按下/抬起(不成对)——用于拖拽:mouse_button(down) → mouse_move* → mouse_button(up)。
+            // mouse_click 是原子按下+抬起,表达不了"按住移动"。
+            "mouse_button" => {
+                let (x, y) = point(entry, i)?;
+                let button = mouse_button(entry.get("button").and_then(Value::as_str));
+                let pressed = entry
+                    .get("pressed")
+                    .and_then(Value::as_bool)
+                    .ok_or(format!("events[{i}]: mouse_button needs a `pressed` bool"))?;
+                push(&mut timeline, &mut pending_delay, click_event(x, y, button, pressed, false), EVENT_GAP);
             }
             "action" => {
                 let action = entry
