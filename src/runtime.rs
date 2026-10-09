@@ -16,7 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use godot::classes::node::ProcessMode;
 use godot::classes::{
     Engine, INode, Input, InputEvent, InputEventAction, InputEventKey, InputEventMouseButton,
-    InputEventMouseMotion, Marshalls, Node, Os, SceneTree,
+    InputEventMouseMotion, Marshalls, Node, Os, RenderingServer, SceneTree,
 };
 use godot::global::MouseButton;
 use godot::prelude::*;
@@ -167,8 +167,15 @@ fn game_tool_definitions() -> Value {
         },
         {
             "name": "capture_screenshot",
-            "description": "Capture the game's rendered frame and return it as an image (downscaled to max 1280px wide).",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Capture the game's rendered frame straight from the viewport (no OS screenshot, works with the window in the background). By default forces a fresh render first so the frame is never stale, and returns it as an image downscaled to max 1280px wide. With `path`, saves a PNG there instead and returns {path, width, height}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force_draw": { "type": "boolean", "description": "Render a fresh frame before capturing (default true). Without it a background/occluded window on macOS can return the last drawn (stale) frame." },
+                    "path": { "type": "string", "description": "Absolute file path to save the PNG to instead of returning base64." },
+                    "max_width": { "type": "number", "description": "Downscale to this width if wider (default 1280; 0 = keep full resolution)." }
+                }
+            }
         },
         {
             "name": "simulate_input",
@@ -214,7 +221,7 @@ fn execute_game_op(name: &str, args: &Value) -> Result<Value, String> {
             let root = scene_tree()?.get_root().ok_or("No root window")?;
             Ok(serialize_node(&root.upcast::<Node>(), max_depth))
         }
-        "capture_screenshot" => capture_screenshot(),
+        "capture_screenshot" => capture_screenshot(args),
         "execute_script" => {
             let code = args
                 .get("code")
@@ -250,15 +257,33 @@ fn get_game_info() -> Result<Value, String> {
     }))
 }
 
-fn capture_screenshot() -> Result<Value, String> {
+fn capture_screenshot(args: &Value) -> Result<Value, String> {
+    // macOS stops redrawing occluded/background windows, so the viewport texture
+    // can hold a stale frame. Render one synchronously first (does not step game logic).
+    if args.get("force_draw").and_then(Value::as_bool).unwrap_or(true) {
+        RenderingServer::singleton().force_draw();
+    }
     let root = scene_tree()?.get_root().ok_or("No root window")?;
     let texture = root.get_texture().ok_or("Viewport has no texture")?;
     let mut image = texture.get_image().ok_or("Failed to read viewport image")?;
 
+    let max_width = args.get("max_width").and_then(Value::as_i64).unwrap_or(1280) as i32;
     let width = image.get_width();
-    if width > 1280 {
-        let height = image.get_height() * 1280 / width;
-        image.resize(1280, height);
+    if max_width > 0 && width > max_width {
+        let height = image.get_height() * max_width / width;
+        image.resize(max_width, height);
+    }
+
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        let err = image.save_png(path);
+        if err != godot::global::Error::OK {
+            return Err(format!("Failed to save PNG to {path}: {err:?}"));
+        }
+        return Ok(json!({
+            "path": path,
+            "width": image.get_width(),
+            "height": image.get_height(),
+        }));
     }
 
     let buffer = image.save_png_to_buffer();
